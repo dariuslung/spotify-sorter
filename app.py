@@ -62,6 +62,28 @@ def get_spotify_oauth():
         scope="playlist-read-private playlist-modify-private playlist-modify-public"
     )
 
+def get_valid_token(request: Request):
+    """Retrieves and optionally refreshes the Spotify token from the session."""
+    token_info = request.session.get("token_info")
+    if not token_info:
+        return None
+        
+    sp_oauth = get_spotify_oauth()
+    if not sp_oauth:
+        return None
+        
+    # Automatically refresh the token if it has expired
+    if sp_oauth.is_token_expired(token_info):
+        try:
+            token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
+            request.session["token_info"] = token_info
+        except Exception:
+            # If the refresh fails (e.g., user revoked app access), clear the session
+            request.session.pop("token_info", None)
+            return None
+            
+    return token_info
+
 base_style = """
 <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #121212; color: #ffffff; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
@@ -125,7 +147,10 @@ def login_post(client_id: str = Form(...), client_secret: str = Form(...)):
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     """The landing page. Checks if the user is already logged in."""
-    token_info = request.session.get("token_info")
+    if not get_spotify_oauth():
+        return RedirectResponse("/login")
+        
+    token_info = get_valid_token(request)
     
     if not token_info:
         return f"""
@@ -181,9 +206,9 @@ def callback(request: Request, code: str):
 @app.get("/playlists", response_class=HTMLResponse)
 def get_playlists(request: Request):
     """Displays a list of the user's playlists."""
-    token_info = request.session.get("token_info")
+    token_info = get_valid_token(request)
     if not token_info:
-        return RedirectResponse("/")
+        return RedirectResponse("/login")
         
     sp = spotipy.Spotify(auth=token_info["access_token"])
     playlists = sp.current_user_playlists()
@@ -259,57 +284,66 @@ def background_sort_task(token_info: dict, playlist_id: str, sort_by: str, order
     sorting_status[playlist_id] = {"status": "Fetching tracks from Spotify...", "progress": 0, "total": 0, "cancelled": False}
     sp = spotipy.Spotify(auth=token_info["access_token"])
     
-    # 1. Fetch all tracks from the playlist (handling pagination)
-    results = sp.playlist_tracks(playlist_id)
-    tracks = results["items"]
-    
-    while results["next"]:
-        if sorting_status[playlist_id].get("cancelled"):
+    try:
+        # 1. Fetch all tracks from the playlist (handling pagination)
+        results = sp.playlist_tracks(playlist_id)
+        tracks = results["items"]
+        
+        while results["next"]:
+            if sorting_status[playlist_id].get("cancelled"):
+                return
+            results = sp.next(results)
+            tracks.extend(results["items"])
+            
+        # 2. Process and sort the tracks using our logic
+        def update_progress(current, total):
+            sorting_status[playlist_id] = {
+                "status": f"Processing ({current}/{total})...", 
+                "progress": current, 
+                "total": total,
+                "cancelled": sorting_status[playlist_id].get("cancelled", False)
+            }
+            
+        def check_cancelled():
+            return sorting_status[playlist_id].get("cancelled", False)
+            
+        sorted_tracks = sort_playlist(
+            tracks, 
+            sort_by=sort_by, 
+            order=order, 
+            progress_callback=update_progress, 
+            check_cancelled=check_cancelled
+        )
+        
+        if check_cancelled():
             return
-        results = sp.next(results)
-        tracks.extend(results["items"])
+            
+        sorting_status[playlist_id]["status"] = "Updating playlist on Spotify..."
         
-    # 2. Process and sort the tracks using our logic
-    def update_progress(current, total):
-        sorting_status[playlist_id] = {
-            "status": f"Processing ({current}/{total})...", 
-            "progress": current, 
-            "total": total,
-            "cancelled": sorting_status[playlist_id].get("cancelled", False)
-        }
+        # 3. Extract the raw Spotify track IDs (ignoring local tracks that don't have IDs)
+        sorted_uris = [
+            track["spotify_id"] for track in sorted_tracks if track.get("spotify_id")
+        ]
         
-    def check_cancelled():
-        return sorting_status[playlist_id].get("cancelled", False)
+        if not sorted_uris:
+            sorting_status[playlist_id] = {"status": "Completed (No tracks found).", "progress": len(tracks), "total": len(tracks)}
+            return
+            
+        # 4. Update the playlist in blocks of 100 (Spotify API limit)
+        sp.playlist_replace_items(playlist_id, sorted_uris[:100])
         
-    sorted_tracks = sort_playlist(
-        tracks, 
-        sort_by=sort_by, 
-        order=order, 
-        progress_callback=update_progress, 
-        check_cancelled=check_cancelled
-    )
-    
-    if check_cancelled():
-        return
+        for i in range(100, len(sorted_uris), 100):
+            sp.playlist_add_items(playlist_id, sorted_uris[i:i+100])
+            
+        sorting_status[playlist_id] = {"status": "Completed!", "progress": len(tracks), "total": len(tracks)}
         
-    sorting_status[playlist_id]["status"] = "Updating playlist on Spotify..."
-    
-    # 3. Extract the raw Spotify track IDs (ignoring local tracks that don't have IDs)
-    sorted_uris = [
-        track["spotify_id"] for track in sorted_tracks if track.get("spotify_id")
-    ]
-    
-    if not sorted_uris:
-        sorting_status[playlist_id] = {"status": "Completed (No tracks found).", "progress": len(tracks), "total": len(tracks)}
-        return
-        
-    # 4. Update the playlist in blocks of 100 (Spotify API limit)
-    sp.playlist_replace_items(playlist_id, sorted_uris[:100])
-    
-    for i in range(100, len(sorted_uris), 100):
-        sp.playlist_add_items(playlist_id, sorted_uris[i:i+100])
-        
-    sorting_status[playlist_id] = {"status": "Completed!", "progress": len(tracks), "total": len(tracks)}
+    except spotipy.SpotifyException as e:
+        if e.http_status == 401:
+            sorting_status[playlist_id]["status"] = "Cancelled: Session expired during sort. Please log out and log in again."
+        else:
+            sorting_status[playlist_id]["status"] = f"Spotify API Error: {e.msg}"
+    except Exception as e:
+        sorting_status[playlist_id]["status"] = f"Unexpected Error: {str(e)}"
 
 @app.get("/status/{playlist_id}")
 def get_sort_status(playlist_id: str):
@@ -328,16 +362,19 @@ def cancel_sort(playlist_id: str):
 @app.get("/sort/{playlist_id}", response_class=HTMLResponse)
 def trigger_sort(request: Request, playlist_id: str, background_tasks: BackgroundTasks, sort_by: str = "date", order: str = "asc"):
     """Endpoint that triggers the sorting background task."""
-    token_info = request.session.get("token_info")
+    token_info = get_valid_token(request)
     if not token_info:
-        return RedirectResponse("/")
+        return RedirectResponse("/login")
         
     # Fetch the playlist name directly from Spotify for the UI
     sp = spotipy.Spotify(auth=token_info["access_token"])
     try:
         playlist_data = sp.playlist(playlist_id, fields="name")
         playlist_name = html.escape(playlist_data.get("name", "Unknown Playlist"))
-    except spotipy.SpotifyException:
+    except spotipy.SpotifyException as e:
+        if e.http_status == 401:
+            # Failsafe in case token somehow slipped through the refresh check
+            return RedirectResponse("/login")
         playlist_name = "Unknown Playlist"
         
     background_tasks.add_task(background_sort_task, token_info, playlist_id, sort_by, order)
