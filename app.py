@@ -1,5 +1,6 @@
 import os
 import json
+import html
 from fastapi import FastAPI, Request, BackgroundTasks, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
@@ -116,7 +117,6 @@ def login_post(client_id: str = Form(...), client_secret: str = Form(...)):
     
     sp_oauth = get_spotify_oauth()
     if not sp_oauth:
-        # Fallback in case of a highly unusual setup failure
         return RedirectResponse("/login")
         
     auth_url = sp_oauth.get_authorize_url()
@@ -164,7 +164,6 @@ def home(request: Request):
 @app.get("/logout")
 def logout(request: Request):
     """Clears the user session and redirects to home."""
-    # Clears the session token but explicitly preserves config.json
     request.session.pop("token_info", None)
     return RedirectResponse("/")
 
@@ -333,6 +332,14 @@ def trigger_sort(request: Request, playlist_id: str, background_tasks: Backgroun
     if not token_info:
         return RedirectResponse("/")
         
+    # Fetch the playlist name directly from Spotify for the UI
+    sp = spotipy.Spotify(auth=token_info["access_token"])
+    try:
+        playlist_data = sp.playlist(playlist_id, fields="name")
+        playlist_name = html.escape(playlist_data.get("name", "Unknown Playlist"))
+    except spotipy.SpotifyException:
+        playlist_name = "Unknown Playlist"
+        
     background_tasks.add_task(background_sort_task, token_info, playlist_id, sort_by, order)
     
     return f"""
@@ -343,7 +350,7 @@ def trigger_sort(request: Request, playlist_id: str, background_tasks: Backgroun
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #121212; color: #ffffff; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }}
             .container {{ text-align: center; max-width: 500px; width: 100%; padding: 40px; background: #181818; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }}
             h1 {{ margin-top: 0; color: #1DB954; font-size: 32px; }}
-            .meta-info {{ color: #b3b3b3; margin-bottom: 30px; font-size: 15px; }}
+            .meta-info {{ color: #b3b3b3; margin-bottom: 30px; font-size: 15px; line-height: 1.6; }}
             strong {{ color: #fff; }}
             .progress-wrapper {{ width: 100%; background-color: #333; border-radius: 500px; height: 16px; overflow: hidden; margin: 24px 0; }}
             #progress-bar {{ width: 0%; height: 100%; background-color: #1DB954; transition: width 0.4s ease, background-color 0.4s ease; }}
@@ -359,7 +366,10 @@ def trigger_sort(request: Request, playlist_id: str, background_tasks: Backgroun
         <div class="container">
             <h1>Sorting in Progress 🎵</h1>
             
-            <p class="meta-info">Sorting by: <strong>{sort_by.capitalize()}</strong> ({order.upper()})</p>
+            <p class="meta-info">
+                Playlist: <strong style="color: #1DB954; font-size: 1.1em;">{playlist_name}</strong><br>
+                Sorting by: <strong>{sort_by.capitalize()}</strong> ({order.upper()})
+            </p>
             
             <div class="progress-wrapper">
                 <div id="progress-bar"></div>
